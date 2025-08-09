@@ -5,6 +5,7 @@ from contextlib import closing
 from datetime import datetime
 import pandas as pd
 import yaml
+import base64
 
 DB_PATH = "ism_partners.db"
 USERS_PATH = "users.yaml"
@@ -19,20 +20,21 @@ HEADER_MAP = {
     "postal_code": ["code postal","cp"],
     "city": ["localité","ville","commune","localite"],
     "phone": ["téléphone","telephone","tel"],
-    "employees_count": ["personnes employées (nombre)","effectif","nb employés","nb employés (nombre)","employés"],
+    "employees_count": ["personnes employées (nombre)","effectif","nb employés","nb employes","employés","employes"],
     "website": ["site internet","site web","site","url"],
     "responsible": ["responsable","nom du contact","contact"],
-    "role": ["fonction","titre"],
+    "role": ["fonction","titre","poste"],
     "email": ["e-mail","email","mail","e-mail 1","email 1","mail 1"],
     "activity": ["activité","activite"],
-    "sector_class": ["classification sectorielle","secteur","categorie"]
+    "sector_class": ["classification sectorielle","secteur","categorie","catégorie"]
 }
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def ensure_schema():
-    schema = """
+    """Create table if needed and run additive migrations (no data loss)."""
+    schema = '''
     CREATE TABLE IF NOT EXISTS partners (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         company_name TEXT NOT NULL,
@@ -50,10 +52,22 @@ def ensure_schema():
         sector_class TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-    """
+    '''
     with closing(get_conn()) as conn:
         cur = conn.cursor()
         cur.executescript(schema)
+        # Add missing columns if table exists with older schema
+        cur.execute("PRAGMA table_info(partners)")
+        existing = {row[1] for row in cur.fetchall()}
+        wanted = {
+            "company_name":"TEXT","address":"TEXT","number":"TEXT","postal_code":"TEXT",
+            "city":"TEXT","phone":"TEXT","employees_count":"INTEGER","website":"TEXT",
+            "responsible":"TEXT","role":"TEXT","email":"TEXT","activity":"TEXT",
+            "sector_class":"TEXT","created_at":"TIMESTAMP"
+        }
+        for col, ctype in wanted.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE partners ADD COLUMN {col} {ctype}")
         conn.commit()
 
 @st.cache_data(show_spinner=False)
@@ -114,6 +128,18 @@ def login(users):
             st.session_state.pop("user_email")
             st.rerun()
 
+def download_db_button():
+    """Show a backup download link in the sidebar when logged in."""
+    try:
+        with open(DB_PATH, "rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode()
+        href = f'<a href="data:file/sqlite;base64,{b64}" download="ism_partners_backup.db">📥 Télécharger la base SQLite</a>'
+        st.sidebar.markdown("### Sauvegarde")
+        st.sidebar.markdown(href, unsafe_allow_html=True)
+    except FileNotFoundError:
+        st.sidebar.error("Base de données introuvable.")
+
 def partner_form(existing=None):
     st.subheader("Fiche partenaire")
     with st.form("partner_form", clear_on_submit=False):
@@ -170,9 +196,9 @@ def partners_table():
     query = "SELECT * FROM partners WHERE 1=1"
     params = []
     if q:
-        query += " AND (company_name LIKE ? OR activity LIKE ? OR responsible LIKE ? OR comments LIKE ? OR city LIKE ?)"
+        query += " AND (company_name LIKE ? OR activity LIKE ? OR responsible LIKE ? OR city LIKE ?)"
         like = f"%{q}%"
-        params += [like, like, like, like, like]
+        params += [like, like, like, like]
     if city:
         query += " AND city LIKE ?"
         params.append(f"%{city}%")
@@ -243,7 +269,7 @@ def import_block():
     cols_map = {}
     for target in EXPECTED:
         default = auto.get(target, None)
-        idx = 1 + list(df.columns).index(default) if default in df.columns else 0
+        idx = 1 + list(df.columns).index(default) if (default in df.columns) else 0
         cols_map[target] = st.selectbox(f"{target}", ["---"] + list(df.columns), index=idx)
 
     if st.button("Importer"):
@@ -277,9 +303,13 @@ def main():
     st.title("Base de données des partenaires – ISM Fontaine L’Evêque")
     st.caption("Accès réservé aux enseignants.")
 
-    # Auth (peut être désactivé pour tests)
-    st.sidebar.header("Connexion")
+    # Connexion
     login(users)
+
+    # Sidebar backup button (visible only when logged in)
+    if "user_email" in st.session_state:
+        download_db_button()
+
     if "user_email" not in st.session_state:
         st.info("Veuillez vous connecter pour accéder à la base de données.")
         st.stop()
