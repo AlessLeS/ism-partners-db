@@ -5,11 +5,13 @@ from datetime import datetime
 import pandas as pd
 import yaml
 import base64
+from pathlib import Path
 
-DB_PATH = "ism_partners.db"
+APP_DIR = Path(__file__).parent.resolve()
+DB_FILENAME = "ism_partners.db"
+DB_PATH = str(APP_DIR / DB_FILENAME)   # ensure stable absolute path next to the script
 USERS_PATH = "users.yaml"
 
-# Expected columns for partners import / form
 EXPECTED = ["company_name","address","number","postal_code","city","phone",
             "employees_count","website","responsible","role","email","activity","sector_class","tags"]
 
@@ -34,7 +36,6 @@ def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def ensure_schema():
-    """Create tables if needed and run additive migrations (no data loss)."""
     schema = '''
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS partners (
@@ -72,7 +73,7 @@ def ensure_schema():
     with closing(get_conn()) as conn:
         cur = conn.cursor()
         cur.executescript(schema)
-        # Add missing columns to partners if table exists with older schema
+        # Additive migration for partners
         cur.execute("PRAGMA table_info(partners)")
         existing = {row[1] for row in cur.fetchall()}
         wanted = {
@@ -84,7 +85,7 @@ def ensure_schema():
         for col, ctype in wanted.items():
             if col not in existing:
                 cur.execute(f"ALTER TABLE partners ADD COLUMN {col} {ctype}")
-        # Create contacts table if missing
+        # Ensure contacts table exists
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='contacts'")
         if cur.fetchone() is None:
             cur.execute('''
@@ -140,7 +141,7 @@ def list_contacts(partner_id:int):
 def upsert_contact(values, contact_id=None):
     fields = ["partner_id","full_name","function","email","phone","mobile","is_jury","notes"]
     if contact_id:
-        setters = ", ".join([f"{f}=?" for f in fields[1:]])  # exclude partner_id
+        setters = ", ".join([f"{f}=?" for f in fields[1:]])
         params = [values.get(f) for f in fields[1:]] + [contact_id]
         exec_sql(f"UPDATE contacts SET {setters} WHERE id=?", params)
         return contact_id
@@ -181,9 +182,10 @@ def login(users):
         if st.sidebar.button("Se déconnecter"):
             st.session_state.pop("user_email")
             st.rerun()
+    # debug info
+    st.sidebar.caption(f"DB: {DB_PATH}")
 
 def download_db_button():
-    """Show a backup download link in the sidebar when logged in."""
     try:
         with open(DB_PATH, "rb") as f:
             data = f.read()
@@ -194,25 +196,6 @@ def download_db_button():
     except FileNotFoundError:
         st.sidebar.error("Base de données introuvable.")
 
-# ---------- UI HELPERS (navigation) ----------
-def set_view(view:str, partner_id:int|None=None):
-    st.session_state["view"] = view
-    if partner_id is not None:
-        st.session_state["selected_partner_id"] = int(partner_id)
-
-def get_view():
-    return st.session_state.get("view","list")
-
-def get_selected_partner():
-    pid = st.session_state.get("selected_partner_id")
-    if pid is None:
-        return None
-    df = run_query("SELECT * FROM partners WHERE id=?", (pid,))
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
-
-# ---------- FORMS ----------
 def partner_form(existing=None):
     st.markdown("### Fiche partenaire")
     with st.form("partner_form", clear_on_submit=False):
@@ -257,10 +240,12 @@ def partner_form(existing=None):
                     "tags": tags.strip()
                 }
                 pid = (existing or {}).get("id")
-                pid = upsert_partner(payload, partner_id=pid)
+                new_id = upsert_partner(payload, partner_id=pid)
                 st.success("Partenaire enregistré.")
-                set_view("detail", pid)
-                st.rerun()
+                # Go to detail view for this partner
+                st.session_state["view"] = "detail"
+                st.session_state["current_partner_id"] = pid or new_id
+                st.experimental_rerun()
 
 def contacts_block(partner_id:int):
     st.markdown("### Contacts du partenaire")
@@ -315,7 +300,7 @@ def contacts_block(partner_id:int):
                 else:
                     upsert_contact(payload, contact_id=None)
                     st.success("Contact ajouté.")
-                st.rerun()
+                st.experimental_rerun()
 
     if not dfc.empty:
         st.markdown("#### Supprimer un contact")
@@ -325,95 +310,98 @@ def contacts_block(partner_id:int):
             if st.button("Supprimer ce contact", type="secondary"):
                 delete_contact(int(to_del))
                 st.warning("Contact supprimé.")
-                st.rerun()
+                st.experimental_rerun()
 
-# ---------- VUES ----------
-def list_view():
+def cards_home():
     st.subheader("Partenaires")
-    top = st.container()
-    with top:
-        c1, c2 = st.columns([3,1])
-        with c1:
-            search = st.text_input("🔎 Rechercher (nom, activité, ville, responsable, tags…)", key="search_term")
-        with c2:
-            if st.button("➕ Nouveau partenaire", use_container_width=True):
-                set_view("create")
-                st.rerun()
+    c1, c2 = st.columns([3,1])
+    with c1:
+        q = st.text_input("🔎 Rechercher (nom, activité, ville, responsable, tags…)", key="search_text")
+    with c2:
+        if st.button("➕ Nouveau partenaire"):
+            st.session_state["view"] = "create"
+            st.experimental_rerun()
 
-    # Instant filtering
-    q = (st.session_state.get("search_term") or "").strip().lower()
-    df = run_query("SELECT * FROM partners ORDER BY company_name")
+    # Build query
+    query = "SELECT * FROM partners WHERE 1=1"
+    params = []
     if q:
-        def row_match(row):
-            hay = " ".join([str(row.get(col,"") or "") for col in ["company_name","activity","city","responsible","sector_class","tags"]]).lower()
-            return q in hay
-        df = df[df.apply(row_match, axis=1)]
+        like = f"%{q}%"
+        query += " AND (company_name LIKE ? OR activity LIKE ? OR responsible LIKE ? OR city LIKE ? OR IFNULL(tags,'') LIKE ?)"
+        params += [like, like, like, like, like]
+    df = run_query(query + " ORDER BY company_name", params)
 
     if df.empty:
         st.info("Aucun partenaire. Ajoutez le premier via **Nouveau partenaire**.")
         return
 
-    # Grid of cards
-    n_cols = 3
-    rows = [df.iloc[i:i+n_cols] for i in range(0, len(df), n_cols)]
+    # cards grid 3 columns
+    per_row = 3
+    rows = [df.iloc[i:i+per_row] for i in range(0, len(df), per_row)]
     for chunk in rows:
-        cols = st.columns(n_cols)
-        for col, (_, r) in zip(cols, chunk.iterrows()):
+        cols = st.columns(per_row)
+        for (idx, row), col in zip(chunk.iterrows(), cols):
             with col:
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid #ddd;border-radius:12px;padding:12px; margin-bottom:12px;">
-                        <div style="font-weight:700;font-size:1.05rem;">{r['company_name']}</div>
-                        <div style="opacity:0.8;">{(r.get('city') or '')}</div>
-                        <div style="opacity:0.8;">{(r.get('activity') or '')}</div>
-                        <div style="margin-top:8px; font-size:0.9rem; opacity:0.8;">{(r.get('sector_class') or '')}</div>
-                    </div>
-                    """, unsafe_allow_html=True
-                )
-                if st.button("Ouvrir la fiche", key=f"open_{int(r['id'])}"):
-                    set_view("detail", int(r["id"]))
-                    st.rerun()
+                st.markdown(f"#### {row['company_name']}")
+                st.caption(f"{row.get('city','') or ''} — {row.get('activity','') or ''}")
+                if row.get('sector_class'):
+                    st.write(f"**Secteur :** {row['sector_class']}")
+                if row.get('tags'):
+                    st.write(f"**Tags :** {row['tags']}")
+                if st.button("Ouvrir la fiche", key=f"open_{int(row['id'])}"):
+                    st.session_state["view"] = "detail"
+                    st.session_state["current_partner_id"] = int(row["id"])
+                    st.experimental_rerun()
 
-def detail_view():
-    data = get_selected_partner()
-    if not data:
-        st.warning("Aucun partenaire sélectionné.")
+def detail_view(pid:int):
+    # fetch partner
+    df = run_query("SELECT * FROM partners WHERE id=?", (pid,))
+    if df.empty:
+        st.error("Partenaire introuvable.")
         if st.button("⬅️ Retour à la liste"):
-            set_view("list")
-            st.rerun()
+            st.session_state["view"] = "home"
+            st.experimental_rerun()
         return
+    row = df.iloc[0].to_dict()
+    top = st.columns([1,1,1])
+    with top[0]:
+        if st.button("⬅️ Retour à la liste"):
+            st.session_state["view"] = "home"
+            st.experimental_rerun()
+    with top[1]:
+        if st.button("➕ Nouveau partenaire"):
+            st.session_state["view"] = "create"
+            st.experimental_rerun()
+    with top[2]:
+        if st.button("🗑️ Supprimer ce partenaire"):
+            delete_partner(pid)
+            st.warning("Partenaire supprimé.")
+            st.session_state["view"] = "home"
+            st.experimental_rerun()
 
-    top = st.container()
-    with top:
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            if st.button("⬅️ Retour à la liste", use_container_width=True):
-                set_view("list")
-                st.rerun()
-        with c2:
-            if st.button("➕ Nouveau partenaire", use_container_width=True):
-                set_view("create")
-                st.rerun()
-        with c3:
-            if st.button("🗑️ Supprimer ce partenaire", type="secondary", use_container_width=True):
-                delete_partner(int(data["id"]))
-                st.warning("Partenaire supprimé.")
-                set_view("list")
-                st.rerun()
-
-    partner_form(existing=data)
+    partner_form(existing=row)
     st.divider()
-    contacts_block(partner_id=int(data["id"]))
+    contacts_block(partner_id=pid)
 
 def create_view():
-    top = st.container()
-    with top:
-        if st.button("⬅️ Retour à la liste"):
-            set_view("list")
-            st.rerun()
+    if st.button("⬅️ Retour à la liste"):
+        st.session_state["view"] = "home"
+        st.experimental_rerun()
     partner_form(existing=None)
 
-# ---------- IMPORT ----------
+def partners_tab():
+    view = st.session_state.get("view", "home")
+    if view == "home":
+        cards_home()
+    elif view == "detail":
+        pid = st.session_state.get("current_partner_id")
+        if not pid:
+            st.session_state["view"] = "home"
+            st.experimental_rerun()
+        detail_view(pid)
+    elif view == "create":
+        create_view()
+
 def auto_map_headers(df):
     mapping = {}
     lower_cols = {c.lower().strip(): c for c in df.columns}
@@ -474,7 +462,6 @@ def import_block():
                 if pd.isna(val):
                     val = ""
                 payload[t] = str(val)
-            # employees_count to int
             try:
                 payload["employees_count"] = int(float(payload["employees_count"])) if payload["employees_count"] else 0
             except:
@@ -482,11 +469,11 @@ def import_block():
             upsert_partner(payload, None)
             inserted += 1
         st.success(f"Import terminé: {inserted} partenaires insérés.")
-        st.rerun()
+        st.session_state["view"] = "home"
+        st.experimental_rerun()
 
-# ---------- MAIN ----------
 def main():
-    st.set_page_config(page_title="ISM Partenaires", page_icon="🤝", layout="wide")
+    st.set_page_config(page_title="CRM Partenaires", page_icon="🤝", layout="wide")
     ensure_schema()
     users = load_users()
 
@@ -504,19 +491,10 @@ def main():
         st.info("Veuillez vous connecter pour accéder à la base de données.")
         st.stop()
 
-    # Tabs: Partenaires (list/cards + detail) | Import
+    # Tabs
     tab1, tab2 = st.tabs(["Partenaires", "Import"])
     with tab1:
-        view = get_view()
-        if view == "list":
-            list_view()
-        elif view == "detail":
-            detail_view()
-        elif view == "create":
-            create_view()
-        else:
-            set_view("list")
-            list_view()
+        partners_tab()
     with tab2:
         import_block()
 
