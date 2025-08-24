@@ -194,6 +194,25 @@ def download_db_button():
     except FileNotFoundError:
         st.sidebar.error("Base de données introuvable.")
 
+# ---------- UI HELPERS (navigation) ----------
+def set_view(view:str, partner_id:int|None=None):
+    st.session_state["view"] = view
+    if partner_id is not None:
+        st.session_state["selected_partner_id"] = int(partner_id)
+
+def get_view():
+    return st.session_state.get("view","list")
+
+def get_selected_partner():
+    pid = st.session_state.get("selected_partner_id")
+    if pid is None:
+        return None
+    df = run_query("SELECT * FROM partners WHERE id=?", (pid,))
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+# ---------- FORMS ----------
 def partner_form(existing=None):
     st.markdown("### Fiche partenaire")
     with st.form("partner_form", clear_on_submit=False):
@@ -238,8 +257,9 @@ def partner_form(existing=None):
                     "tags": tags.strip()
                 }
                 pid = (existing or {}).get("id")
-                upsert_partner(payload, partner_id=pid)
+                pid = upsert_partner(payload, partner_id=pid)
                 st.success("Partenaire enregistré.")
+                set_view("detail", pid)
                 st.rerun()
 
 def contacts_block(partner_id:int):
@@ -307,67 +327,93 @@ def contacts_block(partner_id:int):
                 st.warning("Contact supprimé.")
                 st.rerun()
 
-def partners_tab():
+# ---------- VUES ----------
+def list_view():
     st.subheader("Partenaires")
-    # Left: list + filters | Right: detail of selected or creation form
-    left, right = st.columns([1.3, 2])
-
-    with left:
-        with st.expander("Filtres", expanded=True):
-            q = st.text_input("Recherche (nom, activité, ville, responsable...)")
-            city = st.text_input("Localité")
-            sector = st.text_input("Classification sectorielle")
-            tag = st.text_input("Tag")
-
-        query = "SELECT * FROM partners WHERE 1=1"
-        params = []
-        if q:
-            query += " AND (company_name LIKE ? OR activity LIKE ? OR responsible LIKE ? OR city LIKE ?)"
-            like = f"%{q}%"
-            params += [like, like, like, like]
-        if city:
-            query += " AND city LIKE ?"
-            params.append(f"%{city}%")
-        if sector:
-            query += " AND sector_class LIKE ?"
-            params.append(f"%{sector}%")
-        if tag:
-            query += " AND IFNULL(tags,'') LIKE ?"
-            params.append(f"%{tag}%")
-
-        df = run_query(query + " ORDER BY company_name", params)
-        if df.empty:
-            st.info("Aucun partenaire. Utilisez le panneau de droite pour en ajouter un.")
-            selected_row = None
-        else:
-            st.dataframe(df[["id","company_name","city","activity","sector_class","tags"]],
-                         use_container_width=True, hide_index=True)
-
-            # selection by ID
-            ids = df["id"].tolist()
-            selected_id = st.selectbox("Ouvrir la fiche (par ID)", [""] + [str(i) for i in ids])
-            selected_row = df[df["id"] == int(selected_id)].iloc[0].to_dict() if selected_id else None
-
-            # Export CSV
-            csv_buffer = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Télécharger la liste (CSV)", data=csv_buffer, file_name=f"partenaires_{datetime.now().date()}.csv", mime="text/csv")
-
-    with right:
-        st.markdown("#### Nouvelle fiche / Fiche sélectionnée")
-        # Toggle: create new or edit selected
-        mode = st.radio("Mode fiche", ["Créer un nouveau partenaire", "Éditer le partenaire sélectionné"], horizontal=True)
-        if mode == "Éditer le partenaire sélectionné" and selected_row:
-            partner_form(existing=selected_row)
-            st.divider()
-            contacts_block(partner_id=selected_row["id"])
-            st.divider()
-            if st.button("Supprimer ce partenaire", type="secondary"):
-                delete_partner(selected_row["id"])
-                st.warning("Partenaire supprimé.")
+    top = st.container()
+    with top:
+        c1, c2 = st.columns([3,1])
+        with c1:
+            search = st.text_input("🔎 Rechercher (nom, activité, ville, responsable, tags…)", key="search_term")
+        with c2:
+            if st.button("➕ Nouveau partenaire", use_container_width=True):
+                set_view("create")
                 st.rerun()
-        else:
-            partner_form(existing=None)
 
+    # Instant filtering
+    q = (st.session_state.get("search_term") or "").strip().lower()
+    df = run_query("SELECT * FROM partners ORDER BY company_name")
+    if q:
+        def row_match(row):
+            hay = " ".join([str(row.get(col,"") or "") for col in ["company_name","activity","city","responsible","sector_class","tags"]]).lower()
+            return q in hay
+        df = df[df.apply(row_match, axis=1)]
+
+    if df.empty:
+        st.info("Aucun partenaire. Ajoutez le premier via **Nouveau partenaire**.")
+        return
+
+    # Grid of cards
+    n_cols = 3
+    rows = [df.iloc[i:i+n_cols] for i in range(0, len(df), n_cols)]
+    for chunk in rows:
+        cols = st.columns(n_cols)
+        for col, (_, r) in zip(cols, chunk.iterrows()):
+            with col:
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #ddd;border-radius:12px;padding:12px; margin-bottom:12px;">
+                        <div style="font-weight:700;font-size:1.05rem;">{r['company_name']}</div>
+                        <div style="opacity:0.8;">{(r.get('city') or '')}</div>
+                        <div style="opacity:0.8;">{(r.get('activity') or '')}</div>
+                        <div style="margin-top:8px; font-size:0.9rem; opacity:0.8;">{(r.get('sector_class') or '')}</div>
+                    </div>
+                    """, unsafe_allow_html=True
+                )
+                if st.button("Ouvrir la fiche", key=f"open_{int(r['id'])}"):
+                    set_view("detail", int(r["id"]))
+                    st.rerun()
+
+def detail_view():
+    data = get_selected_partner()
+    if not data:
+        st.warning("Aucun partenaire sélectionné.")
+        if st.button("⬅️ Retour à la liste"):
+            set_view("list")
+            st.rerun()
+        return
+
+    top = st.container()
+    with top:
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
+            if st.button("⬅️ Retour à la liste", use_container_width=True):
+                set_view("list")
+                st.rerun()
+        with c2:
+            if st.button("➕ Nouveau partenaire", use_container_width=True):
+                set_view("create")
+                st.rerun()
+        with c3:
+            if st.button("🗑️ Supprimer ce partenaire", type="secondary", use_container_width=True):
+                delete_partner(int(data["id"]))
+                st.warning("Partenaire supprimé.")
+                set_view("list")
+                st.rerun()
+
+    partner_form(existing=data)
+    st.divider()
+    contacts_block(partner_id=int(data["id"]))
+
+def create_view():
+    top = st.container()
+    with top:
+        if st.button("⬅️ Retour à la liste"):
+            set_view("list")
+            st.rerun()
+    partner_form(existing=None)
+
+# ---------- IMPORT ----------
 def auto_map_headers(df):
     mapping = {}
     lower_cols = {c.lower().strip(): c for c in df.columns}
@@ -438,6 +484,7 @@ def import_block():
         st.success(f"Import terminé: {inserted} partenaires insérés.")
         st.rerun()
 
+# ---------- MAIN ----------
 def main():
     st.set_page_config(page_title="ISM Partenaires", page_icon="🤝", layout="wide")
     ensure_schema()
@@ -457,10 +504,19 @@ def main():
         st.info("Veuillez vous connecter pour accéder à la base de données.")
         st.stop()
 
-    # Tabs: Partenaires (list+detail) | Import
+    # Tabs: Partenaires (list/cards + detail) | Import
     tab1, tab2 = st.tabs(["Partenaires", "Import"])
     with tab1:
-        partners_tab()
+        view = get_view()
+        if view == "list":
+            list_view()
+        elif view == "detail":
+            detail_view()
+        elif view == "create":
+            create_view()
+        else:
+            set_view("list")
+            list_view()
     with tab2:
         import_block()
 
